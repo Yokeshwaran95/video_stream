@@ -1,60 +1,155 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Live Video with AI Response</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebRTC Video Streaming</title>
+  <style>
+    video {
+      width: 45%;
+      height: auto;
+      margin: 10px;
+    }
+  </style>
 </head>
 <body>
-    <h1>Live Video Stream</h1>
-    <video id="video" autoplay playsinline style="width: 60%; border: 2px solid black;"></video>
-    <p><strong>AI Response:</strong> <span id="ai-response">Waiting for response...</span></p>
+  <h1>WebRTC Video Streaming</h1>
 
-    <script>
-        const video = document.getElementById("video");
-        const aiResponse = document.getElementById("ai-response");
-        const pc = new RTCPeerConnection();
+  <!-- Local video (webcam) stream -->
+  <video id="localVideo" autoplay muted></video>
 
-        const ws = new WebSocket("ws://localhost:8000/ws");
+  <!-- Remote video stream -->
+  <video id="remoteVideo" autoplay></video>
+  <p><strong>AI Response:</strong> <span id="ai-response">Waiting for response...</span></p>
 
-        ws.onmessage = async (event) => {
-            const data = JSON.parse(event.data);
 
-            if (data.answer) {
-                console.log("Received SDP Answer:", data.answer);
-            if (data.answer.sdp.includes("m=") && data.answer.type) {
-                await pc.setRemoteDescription(new RTCSessionDescription({
-                    sdp: data.answer.sdp,
-                    type: data.answer.type
-                }));
-            } else {
-                console.error("Invalid SDP Answer received:", data.answer);
-            }
-            } else if (data.candidate) {
-                if (data.candidate.candidate) {
-                    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-                }
-            } else if (data.response) {
-                aiResponse.innerText = data.response;
-            }
-        };
+  <script>
+    // WebSocket connection to FastAPI signaling server
+    const signalingServerUrl = "ws://localhost:8000/ws"; // Replace with your server URL
+    const socket = new WebSocket(signalingServerUrl);
+    const aiResponse = document.getElementById("ai-response");
 
-        ws.onopen = async () => {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            ws.send(JSON.stringify({ offer }));
-        };
 
-        pc.ontrack = (event) => {
-            video.srcObject = event.streams[0];
-        };
+    let localStream;
+    let peerConnection;
+    let remoteStream = new MediaStream();
+    const iceServers = [
+      { urls: "stun:stun.l.google.com:19302" }, // STUN server
+    ];
 
-        // Get user media and send to WebRTC
-        navigator.mediaDevices.getUserMedia({ video: true })
-            .then(stream => {
-                stream.getTracks().forEach(track => pc.addTrack(track, stream));
-            })
-            .catch(error => console.error("Error accessing webcam:", error));
-    </script>
+    // Access the webcam
+    async function getLocalStream() {
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true,
+        });
+        document.getElementById("localVideo").srcObject = localStream;
+      } catch (error) {
+        console.error("Error accessing media devices.", error);
+      }
+    }
+
+    // WebSocket signaling message handler
+    socket.onmessage = async function (event) {
+      const message = JSON.parse(event.data);
+
+      if (message.offer) {
+        await handleOffer(message.offer);
+      }
+
+      if (message.answer) {
+        await handleAnswer(message.answer);
+      }
+
+      if (message.candidate) {
+        await handleCandidate(message.candidate);
+      }
+    };
+
+    // WebRTC Peer Connection setup
+    function createPeerConnection() {
+      peerConnection = new RTCPeerConnection({ iceServers });
+      peerConnection.onicecandidate = handleIceCandidate;
+      peerConnection.ontrack = handleTrack;
+      peerConnection.oniceconnectionstatechange = handleIceConnectionStateChange;
+
+      localStream.getTracks().forEach((track) => {
+        peerConnection.addTrack(track, localStream);
+      });
+    }
+
+    // Handle ICE candidates
+    function handleIceCandidate(event) {
+      if (event.candidate) {
+        socket.send(
+          JSON.stringify({
+            candidate: event.candidate,
+          })
+        );
+      }
+    }
+
+    // Handle incoming video track
+    function handleTrack(event) {
+      remoteStream.addTrack(event.track);
+      document.getElementById("remoteVideo").srcObject = remoteStream;
+    }
+
+    // Handle ICE connection state change
+    function handleIceConnectionStateChange() {
+      console.log("ICE Connection State:", peerConnection.iceConnectionState);
+    }
+
+    // Handle incoming offer
+    async function handleOffer(offer) {
+      await createPeerConnection();
+      const desc = new RTCSessionDescription({ type: "offer", sdp: offer });
+      await peerConnection.setRemoteDescription(desc);
+
+      const answer = await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(answer);
+
+      socket.send(
+        JSON.stringify({
+          answer: answer.sdp,
+        })
+      );
+    }
+
+    // Handle incoming answer
+    async function handleAnswer(answer) {
+      const desc = new RTCSessionDescription({ type: "answer", sdp: answer });
+      await peerConnection.setRemoteDescription(desc);
+    }
+
+    // Handle incoming ICE candidate
+    async function handleCandidate(candidate) {
+      try {
+        await peerConnection.addIceCandidate(candidate);
+      } catch (e) {
+        console.error("Error adding received ICE candidate", e);
+      }
+    }
+
+    // Start the video call
+    async function startCall() {
+      await getLocalStream();
+      createPeerConnection();
+
+      // Send offer to signaling server
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+
+      socket.send(
+        JSON.stringify({
+          offer: offer.sdp,
+        })
+      );
+    }
+
+    // Start the call when the page loads
+    startCall();
+  </script>
 </body>
 </html>
