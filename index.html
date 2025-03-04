@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Video with AI Response</title>
+</head>
+<body>
+    <h1>Live Video Stream</h1>
+    <video id="video" autoplay playsinline style="width: 60%; border: 2px solid black;"></video>
+    <p><strong>AI Response:</strong> <span id="ai-response">Waiting for response...</span></p>
+
+    <script>
+        const video = document.getElementById("video");
+        const aiResponse = document.getElementById("ai-response");
+        const pc = new RTCPeerConnection();
+
+        const ws = new WebSocket("ws://localhost:8000/ws");
+
+        ws.onmessage = async (event) => {
+            const data = JSON.parse(event.data);
+
+            if (data.answer) {
+                console.log("Received SDP Answer:", data.answer);
+            if (data.answer.sdp.includes("m=") && data.answer.type) {
+                await pc.setRemoteDescription(new RTCSessionDescription({
+                    sdp: data.answer.sdp,
+                    type: data.answer.type
+                }));
+            } else {
+                console.error("Invalid SDP Answer received:", data.answer);
+            }
+            } else if (data.candidate) {
+                if (data.candidate.candidate) {
+                    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                }
+            } else if (data.response) {
+                aiResponse.innerText = data.response;
+            }
+        };
+
+        ws.onopen = async () => {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify({ offer }));
+        };
+
+        pc.ontrack = (event) => {
+            video.srcObject = event.streams[0];
+        };
+
+        // Get user media and send to WebRTC
+        navigator.mediaDevices.getUserMedia({ video: true })
+            .then(stream => {
+                stream.getTracks().forEach(track => pc.addTrack(track, stream));
+            })
+            .catch(error => console.error("Error accessing webcam:", error));
+    </script>
+</body>
+</html>
