@@ -1,27 +1,61 @@
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from aiortc import RTCPeerConnection, VideoStreamTrack, RTCSessionDescription,MediaStreamTrack, RTCConfiguration, RTCIceServer
+from aiortc.contrib.signaling import BYE, TcpSocketSignaling
+
 from aiortc.contrib.media import MediaRecorder
 import av
-import google.generativeai as genai
+import cv2
+# import google.generativeai as genai
 import os
 
 app = FastAPI()
 pcs = set()
 
 # Configure Gemini AI
-genai.configure(api_key="YOUR_GEMINI_API_KEY")
+# genai.configure(api_key="YOUR_GEMINI_API_KEY")
 
-ice_servers = [
-    RTCIceServer(urls="stun:stun.l.google.com:19302"),  # Google STUN server
-    RTCIceServer(urls="stun:stun1.l.google.com:19302")  # Example TURN server
-]
-configuration = RTCConfiguration(iceServers=ice_servers)
+class WebRTCSignaling:
+    def __init__(self):
+        self.clients = []
 
-class EmptyVideoTrack(MediaStreamTrack):
-    kind = "video"
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.clients.append(websocket)
+
+    async def disconnect(self, websocket: WebSocket):
+        self.clients.remove(websocket)
+        await websocket.close()
+
+    async def send_to_all(self, message: dict):
+        for client in self.clients:
+            await client.send_json(message)
+
+signaling = WebRTCSignaling()
+
+ 
+class VideoTrack(MediaStreamTrack):
+    def __init__(self):
+        super().__init__()
+        self._paused = False
 
     async def recv(self):
+        if not self._paused:
+            frame = await self._generate_frame()  # Replace with your video source (e.g., camera)
+            return frame
         return None
+
+    async def _generate_frame(self):
+        self.cap = cv2.VideoCapture(0)
+        # Capture frame from the video stream
+        ret, frame = self.cap.read()
+        
+        if not ret:
+            print("Failed to grab frame")
+            return None
+
+        # Here you can process the frame (e.g., apply filters, add text, etc.)
+        # For now, we just return the frame as-is
+        return frame
 
 def fix_sdp(sdp):
     """Ensure SDP has valid media and directions"""
@@ -45,62 +79,70 @@ async def process_frame(frame):
         return str(e)
 
 
+async def create_peer_connection():
+
+    stun_server = RTCIceServer(urls=["stun:openrelay.metered.ca:80"])
+
+    turn_server = RTCIceServer(
+        urls=["turn:openrelay.metered.ca:443", "turn:openrelay.metered.ca:80","turn:openrelay.metered.ca:443?transport=tcp"],
+        username="openrelayproject",
+        credential="openrelayproject"
+    )
+
+    # Create RTCConfiguration
+    rtc_config = RTCConfiguration(iceServers=[stun_server, turn_server])
+
+    # Creating a peer connection with ICE configuration
+    peer_connection = RTCPeerConnection(configuration=rtc_config)
+
+    @peer_connection.on("icecandidate")
+    def on_icecandidate(candidate):
+        if candidate:
+            # Send the ICE candidate to the other peer via signaling
+            pass
+
+    @peer_connection.on("iceconnectionstatechange")
+    def on_iceconnectionstatechange():
+        print("ICE Connection State:", peer_connection.iceConnectionState)
+
+    return peer_connection
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket for WebRTC signaling and processing"""
-    await websocket.accept()
-
-    pc = RTCPeerConnection()
-    pcs.add(pc)
-    empty_video = EmptyVideoTrack()
-    pc.addTrack(empty_video)
-
-    @pc.on("track")
-    async def on_track(track):
-        if track.kind == "video":
-            recorder = MediaRecorder("output.mp4")
-            recorder.addTrack(track)
-            await recorder.start()
-
-            while True:
-                frame = await track.recv()
-                response = await process_frame(frame)
-
-                # Send AI response back to frontend
-                await websocket.send_json({"response": response})
-
-    @pc.on("icecandidate")
-    async def on_icecandidate(candidate):
-        if candidate:
-            await websocket.send_json({"candidate": candidate.to_dict()})
-
+    await signaling.connect(websocket)
     try:
+        while True:
+            message = await websocket.receive_json()
+            if "offer" in message:
+                offer = RTCSessionDescription(sdp=message["offer"], type="offer")
 
-        if not any(sender.track == empty_video for sender in pc.getSenders()):
-            pc.addTrack(empty_video)
-        data = await websocket.receive_json()
-        offer = data.get("offer")
+                # Create a new peer connection
+                peer_connection = await create_peer_connection()
 
-        if offer:
-            rtc_offer = RTCSessionDescription(sdp=offer["sdp"], type=offer["type"])
-            await pc.setRemoteDescription(rtc_offer)  # ✅ Set only once
+                # Set the offer received from the client
+                await peer_connection.setRemoteDescription(offer)
 
-            answer = await pc.createAnswer()
-            answer.sdp = fix_sdp(answer.sdp)
-            await pc.setLocalDescription(answer)
+                # Create an answer to send back to the client
+                answer = await peer_connection.createAnswer()
+                await peer_connection.setLocalDescription(answer)
 
-            await websocket.send_json({
-                    "answer": {
-                        "sdp": pc.localDescription.sdp,
-                        "type": pc.localDescription.type
-                    }
+                # Send back the answer (SDP) to the client
+                await signaling.send_to_all({
+                    "answer": answer.sdp
                 })
 
-    # except Exception as e:
-    #     print(f"WebRTC error: {e}")
-    finally:
-        await pc.close()
+                # Add a video track to the peer connection (you can replace it with a real camera stream)
+                video_track = VideoTrack()
+                peer_connection.addTrack(video_track)
+            
+            elif "candidate" in message:
+                # Add ICE candidates to the peer connection
+                candidate = message["candidate"]
+                await peer_connection.addIceCandidate(candidate)
 
+    except WebSocketDisconnect:
+        print("Client disconnected")
+        await signaling.disconnect(websocket)
 
 if __name__ == "__main__":
     import uvicorn
